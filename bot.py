@@ -6,6 +6,8 @@ from discord.ext import commands
 from discord import app_commands
 import asyncio
 import random
+import secrets
+import time
 import smtplib
 from email.mime.text import MIMEText
 
@@ -13,8 +15,11 @@ from typing import Union, cast
 
 #Init Bot Settings
 intents = discord.Intents.default()
-intents.message_content = True
 intents.members = True
+# NOTE: message_content intent removed - nothing in this file reads raw message
+# content (everything is slash commands). Re-enable only if you add a feature
+# that needs it; it's a privileged intent and Discord scrutinizes bots that
+# request it without using it.
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
@@ -23,6 +28,19 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 MAX_TEAM_SIZE = 4
 CAPSTONE_TEAM_SIZE = 5
 TEAM_FORMATION_TIMEOUT = 120
+
+# --- Verification security constants ---
+MAX_CODE_ATTEMPTS = 5          # wrong guesses allowed before a code is invalidated
+EMAIL_RESEND_COOLDOWN = 60     # seconds between verification email sends per-email
+VERIFY_ATTEMPT_WINDOW = 10     # minimum seconds between /verify attempts per-user
+
+# In-memory trackers. NOTE: these reset on bot restart, which is fine for
+# rate-limiting (worst case someone gets a few extra tries right after a
+# deploy) but is NOT a substitute for storing expires_at in the DB - see
+# the /verify command and the accompanying note near send flow below.
+_code_attempts: dict[str, int] = {}        # code -> wrong-guess count
+_last_email_sent: dict[str, float] = {}    # email -> unix timestamp
+_last_verify_attempt: dict[int, float] = {}  # discord_id -> unix timestamp
 
 # Maps role names to corresponding role IDs from configuration
 role_map = {
@@ -45,7 +63,7 @@ def create_embed(title: str, description: str, color=OHIO_RED) -> discord.Embed:
 
 def generate_random_code(n): # TESTED
     """
-    Generates random string of specified length using uppercase letters, lowercase letters, and digits.
+    Generates a cryptographically random numeric string of specified length.
 
     Args:
         length (int): the length of random string to generate
@@ -56,8 +74,25 @@ def generate_random_code(n): # TESTED
     Returns:
         str: A random string of specified length, containing digits.
     """
+    # Uses `secrets` (CSPRNG) instead of `random` - verification codes are a
+    # security token and must not be predictable via the standard PRNG.
     characters = '0123456789'
-    return ''.join(random.choices(characters, k=n))    
+    return ''.join(secrets.choice(characters) for _ in range(n))
+
+def is_organizer(member: discord.Member) -> bool:
+    """
+    Code-level admin check, used IN ADDITION to @app_commands.default_permissions.
+    default_permissions only sets the *default* shown in Discord's UI - server
+    admins can override per-command permissions there, so any destructive/admin
+    command should also verify explicitly in code rather than trusting Discord's
+    configurable integration settings alone.
+    """
+    if member.guild_permissions.administrator:
+        return True
+    organizer_role_id = getattr(config, "discord_organizer_role_id", None)
+    if organizer_role_id and any(r.id == organizer_role_id for r in member.roles):
+        return True
+    return False
 
 async def sync_user_roles(member: discord.Member): # TESTED
     """
@@ -216,7 +251,6 @@ async def perform_team_join(member: discord.Member, team_id: int): # TESTED
     
     # DB Update
     records.join_team(member.id, team_id)
-    records.remove_from_lfg(member.id)
     
     guild = bot.get_guild(config.discord_guild_id)
     team_data = records.get_team(team_id)
@@ -312,6 +346,15 @@ async def verify(interaction: discord.Interaction, email_or_code: str): # TESTED
         await interaction.followup.send(content=f"Welcome, {first_name}! You are already verified.")
         return
 
+    # Basic per-user throttle so a script can't hammer /verify with guesses
+    # back-to-back. This is a floor, not the main defense - see the
+    # per-code attempt counter below for the real brute-force protection.
+    now = time.monotonic()
+    last_attempt = _last_verify_attempt.get(user.id, 0)
+    if now - last_attempt < VERIFY_ATTEMPT_WINDOW:
+        await interaction.followup.send(content="You're doing that too fast - please wait a few seconds and try again.")
+        return
+    _last_verify_attempt[user.id] = now
 
     # Case 1: CODE was entered (Check Code)
     if (email_or_code.isdigit()):
@@ -321,12 +364,21 @@ async def verify(interaction: discord.Interaction, email_or_code: str): # TESTED
         if not records.code_exists(code):
             await interaction.followup.send(content="Your Verification Code is either not valid or has expired. Please request a new one.")
             return
-            
+
         # Retrieve Message ID or Verification message
         code_info = records.get_value_from_code(code)
 
         # Check that user_id matches user entering the code
         if code_info['discord_id'] != user.id:
+            # Track wrong guesses per-code so someone can't brute force the
+            # remaining ~1M-code space before it expires. After too many
+            # wrong guesses for a given code, kill it and force a resend.
+            _code_attempts[code] = _code_attempts.get(code, 0) + 1
+            if _code_attempts[code] >= MAX_CODE_ATTEMPTS:
+                records.remove_code(code)
+                _code_attempts.pop(code, None)
+                await interaction.followup.send(content="Too many failed attempts for this code. It has been invalidated - please request a new one by entering the email you registered with.")
+                return
             await interaction.followup.send(content=f"The code you entered is not associated with your discord account. Please request a new one by entering the email you registered with.")
             return
 
@@ -337,6 +389,7 @@ async def verify(interaction: discord.Interaction, email_or_code: str): # TESTED
         # Add user to verified database
         records.add_verified_user(email, user.id, user.name)
         records.remove_code(code)
+        _code_attempts.pop(code, None)
 
         # Assign user with all given roles
         await sync_user_roles(user)
@@ -358,6 +411,15 @@ async def verify(interaction: discord.Interaction, email_or_code: str): # TESTED
             await interaction.followup.send(content=f"A User with that email address is already verified. \nPlease reregister with a different email address at {config.contact_registration_link}")
             return
 
+        # Cooldown to prevent someone spamming another participant's inbox
+        # with repeated verification emails (harassment + spam-flag risk).
+        now = time.monotonic()
+        last_sent = _last_email_sent.get(email, 0)
+        if now - last_sent < EMAIL_RESEND_COOLDOWN:
+            wait_left = round(EMAIL_RESEND_COOLDOWN - (now - last_sent))
+            await interaction.followup.send(content=f"A verification email was already sent recently. Please wait {wait_left} seconds before requesting another.")
+            return
+
         # ------------- Happy Case --------------------
 
         # NOTE: DB automatically replaces any code entry that matches discord_id, code, or email
@@ -367,14 +429,25 @@ async def verify(interaction: discord.Interaction, email_or_code: str): # TESTED
             CODE = generate_random_code(6)
 
         if(await send_verification_email(email, CODE, user.name)):
+            _last_email_sent[email] = now
+            # IMPORTANT: records.add_code should persist an expiry timestamp
+            # (e.g. now + config.email_code_expiration_time) alongside the
+            # code, and records.code_exists()/get_value_from_code() should
+            # check that timestamp. Relying solely on the asyncio.sleep below
+            # means a bot restart before the sleep completes leaves the code
+            # valid forever. That's a records.py change - flagging it here
+            # since this file can't fix it on its own.
             records.add_code(email, user.id, CODE)
             await interaction.followup.send(content=f"Check your inbox for an email from `<{config.email_address}>` with a verification link. Please check that email and enter the code in this format \n `/verify (code)`\n\nBe sure to check your junk folder if you have trouble finding it")
         else:
             await interaction.followup.send(content="Failed to send verification email. Please contact an organizer for assistance.")
+            return
 
-        # Wait for timeout then delete verification code
+        # Wait for timeout then delete verification code (belt-and-suspenders
+        # cleanup; the DB-side expiry check above is the real guarantee)
         await asyncio.sleep(config.email_code_expiration_time)
         records.remove_code(CODE)
+        _code_attempts.pop(CODE, None)
 
 @app_commands.guild_only()
 @bot.tree.command(name="create_team", description="Create a new team for this event")
@@ -890,6 +963,10 @@ bot.tree.add_command(lfg_group)
 
 
 # ------------------- Admin Only Commands ----------------------
+# All admin commands below combine @app_commands.default_permissions (the
+# Discord-UI-configurable default) with an explicit is_organizer() check in
+# code, since server admins can override per-command permissions in Discord's
+# integration settings and silently open these up to non-admins.
 
 @app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
@@ -910,7 +987,11 @@ async def overify(interaction: discord.Interaction, member_to_promote: discord.M
     """
 
     await interaction.response.defer(ephemeral=True)
-    
+
+    if not is_organizer(interaction.user):
+        await interaction.followup.send(content="You do not have permission to use this command.")
+        return
+
     #Check if role is valid to be overified with
     if not (role in role_map):
         await interaction.followup.send(content=f"`<{role}>` is not a valid role. \nPlease chose either `participant`, `mentor`, or `judge`")
@@ -955,8 +1036,22 @@ async def remove_team(interaction: discord.Interaction, team_role: discord.Role,
     """
     await interaction.response.defer(ephemeral=True)
 
+    if not is_organizer(interaction.user):
+        await interaction.followup.send(content="You do not have permission to use this command.")
+        return
+
     # Retrieve team details before removal
     team_name = team_role.name
+
+    # Validate the team actually exists before touching the DB - the role
+    # passed in might not correspond to any team, and get_team()['id'] would
+    # previously raise an unhandled error in that case.
+    if not records.team_exists(team_name):
+        await interaction.followup.send(
+            content=f"`<{team_name}>` is not associated with a valid team. Please select a role that corresponds to an existing team."
+        )
+        return
+
     team_id = records.get_team(team_name)['id']
     members = records.get_team_members(team_name)
 
@@ -1052,6 +1147,10 @@ async def broadcast(interaction: discord.Interaction, message: str):
         return
     await interaction.response.defer(ephemeral=True)
 
+    if not is_organizer(interaction.user):
+        await interaction.followup.send(content="You do not have permission to use this command.")
+        return
+
     teams = records.get_all_teams()
     for team in teams:
         team_text_channel = cast(discord.TextChannel, guild.get_channel(team.get("text_id")))
@@ -1106,6 +1205,29 @@ async def sync(ctx: commands.Context, spec: str):
     await ctx.send("Please provide a valid spec argument (local, global, clear)")
 
 
+# ------------------- Error Handling ----------------------
+
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    """
+    Central handler for slash command errors, including permission check
+    failures raised by @app_commands.checks.has_any_role / has_permissions.
+    Without this, an unhandled CheckFailure just logs a traceback and the
+    user gets no response (or, worse, a raw error surfaced to them).
+    """
+    if isinstance(error, app_commands.CheckFailure):
+        msg = "You do not have permission to use this command."
+    else:
+        msg = "Something went wrong running that command. Please try again or contact an organizer."
+        print(f"Unhandled app command error: {error!r}")
+
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(content=msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(content=msg, ephemeral=True)
+    except discord.errors.InteractionResponded:
+        pass
 
 
 # When the bot is ready, this automatically runs
